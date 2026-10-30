@@ -1,0 +1,91 @@
+-- Core Silver/Gold processing SQL.
+-- Python calls these statements after raw ingestion. Business date and run ID
+-- are supplied as bind variables by src/pipeline.py.
+
+-- The Python implementation performs record-level transaction validation and
+-- duplicate/conflicting payload handling. This SQL file is provided for
+-- review and ad-hoc execution of the principal Gold logic.
+
+-- A. Portfolio position valuation:
+-- Bind :run_id and :business_date (DATE).
+INSERT INTO GOLD_PORTFOLIO_POSITIONS (
+    RUN_ID, BUSINESS_DATE, PORTFOLIO_ID, SECURITY_ID, QUANTITY,
+    MARKET_PRICE, MARKET_VALUE, PRICE_DATE, PRICE_SOURCE, CURRENCY,
+    SOURCE_POSITION_DATE
+)
+WITH SNAPSHOTS AS (
+    SELECT P.*,
+           ROW_NUMBER() OVER (
+               PARTITION BY P.PORTFOLIO_ID, P.SECURITY_ID
+               ORDER BY P.POSITION_DATE DESC
+           ) AS RN
+    FROM POSITIONS P
+    WHERE P.POSITION_DATE <= :business_date
+),
+BALANCES AS (
+    SELECT
+        P.PORTFOLIO_ID,
+        P.SECURITY_ID,
+        P.POSITION_DATE,
+        P.CURRENCY,
+        P.QUANTITY + NVL(SUM(T.QUANTITY), 0) AS CLOSING_QUANTITY
+    FROM SNAPSHOTS P
+    LEFT JOIN TRANSACTIONS T
+      ON T.PORTFOLIO_ID = P.PORTFOLIO_ID
+     AND T.SECURITY_ID = P.SECURITY_ID
+     AND T.TRADE_DATE > P.POSITION_DATE
+     AND T.TRADE_DATE <= :business_date
+    WHERE P.RN = 1
+    GROUP BY P.PORTFOLIO_ID, P.SECURITY_ID, P.POSITION_DATE,
+             P.CURRENCY, P.QUANTITY
+),
+PRICES AS (
+    SELECT SECURITY_ID, PRICE_DATE, PRICE, PRICE_CURRENCY, PRICE_SOURCE
+    FROM (
+        SELECT M.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY M.SECURITY_ID
+                   ORDER BY M.PRICE_DATE DESC
+               ) AS RN
+        FROM MARKET_PRICES M
+        WHERE M.PRICE_DATE <= :business_date
+    )
+    WHERE RN = 1
+)
+SELECT
+    :run_id,
+    :business_date,
+    B.PORTFOLIO_ID,
+    B.SECURITY_ID,
+    B.CLOSING_QUANTITY,
+    M.PRICE,
+    ROUND(B.CLOSING_QUANTITY * M.PRICE, 2),
+    M.PRICE_DATE,
+    M.PRICE_SOURCE,
+    B.CURRENCY,
+    B.POSITION_DATE
+FROM BALANCES B
+JOIN PRICES M ON M.SECURITY_ID = B.SECURITY_ID
+JOIN SECURITY_MASTER S ON S.SECURITY_ID = B.SECURITY_ID
+WHERE M.PRICE_DATE >= :business_date - 3
+  AND M.PRICE > 0
+  AND M.PRICE_CURRENCY = B.CURRENCY
+  AND :business_date >= S.EFFECTIVE_FROM
+  AND (S.EFFECTIVE_TO IS NULL OR :business_date <= S.EFFECTIVE_TO);
+
+-- B. Restricted-security exceptions. Bind :run_id and :business_date.
+INSERT INTO GOLD_COMPLIANCE_EXCEPTIONS (
+    RUN_ID, TRANSACTION_ID, PORTFOLIO_ID, SECURITY_ID, TRADE_DATE,
+    RESTRICTION_TYPE, EXCEPTION_REASON, SOURCE_FILE, SOURCE_ROW_NUMBER
+)
+SELECT
+    :run_id, T.TRANSACTION_ID, T.PORTFOLIO_ID, T.SECURITY_ID, T.TRADE_DATE,
+    R.RESTRICTION_TYPE, 'TRADE DURING ACTIVE RESTRICTION',
+    T.SOURCE_FILE, T.SOURCE_ROW_NUMBER
+FROM TRANSACTIONS T
+JOIN RESTRICTED_SECURITIES R
+  ON R.SECURITY_ID = T.SECURITY_ID
+ AND T.TRADE_DATE >= R.EFFECTIVE_FROM
+ AND (R.EFFECTIVE_TO IS NULL OR T.TRADE_DATE <= R.EFFECTIVE_TO)
+WHERE UPPER(R.STATUS) = 'ACTIVE'
+  AND T.RUN_ID = :run_id;
